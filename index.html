@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Шифратор / Дешифратор — Prototype</title>
+<style>
+  body{font-family:Inter,Segoe UI,Roboto,Arial;margin:20px;background:#0f1724;color:#e6eef8}
+  .card{background:#0b1220;padding:18px;border-radius:12px;box-shadow:0 6px 20px rgba(2,6,23,.6);max-width:920px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 12px}
+  label{display:block;margin:10px 0 6px;font-size:13px;color:#bcd}
+  textarea{width:100%;min-height:110px;padding:10px;border-radius:8px;border:1px solid #223;}
+  input[type="text"], input[type="file"]{width:100%;padding:8px;border-radius:8px;border:1px solid #223;background:#07101b;color:#eaf3ff}
+  .row{display:flex;gap:12px}
+  .col{flex:1}
+  button{background:#06b6d4;border:none;padding:8px 12px;border-radius:8px;color:#042a2f;font-weight:600;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid #2a3a44;color:#cfeaf6}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .result{background:#021021;padding:10px;border-radius:8px;margin-top:10px;word-break:break-all}
+  small.hint{color:#9db7c9}
+  .flex-between{display:flex;justify-content:space-between;align-items:center}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="flex-between">
+    <h1>Шифратор / Дешифратор — Prototype (AES-256-GCM)</h1>
+    <small class="hint">Работает в браузере — Base64 ключ 32 байта или пароль (PBKDF2)</small>
+  </div>
+
+  <label>Сообщение</label>
+  <textarea id="plaintext" placeholder="Hello, this is secret message!"></textarea>
+
+  <div class="row" style="margin-top:8px">
+    <div class="col">
+      <label>Ключ (Base64 32 байта)</label>
+      <input id="keyInput" type="text" placeholder="Если не ставите галку 'пароль' — вставляйте Base64 32 байта">
+    </div>
+    <div style="width:200px">
+      <label>&nbsp;</label>
+      <div class="controls">
+        <button id="genKey">Сгенерировать ключ</button>
+        <button id="usePass" class="ghost">Использовать пароль</button>
+      </div>
+    </div>
+  </div>
+
+  <label style="margin-top:10px">Пароль (если включено)</label>
+  <input id="passInput" type="text" placeholder="Введите пароль (используется PBKDF2 с солью)">
+
+  <div style="margin-top:12px" class="row">
+    <div class="col">
+      <label>Файл (зашифровать / расшифровать)</label>
+      <input id="fileInput" type="file">
+    </div>
+    <div style="width:240px">
+      <label>&nbsp;</label>
+      <div class="controls">
+        <button id="encryptBtn">🔒 Зашифровать</button>
+        <button id="decryptBtn">🔓 Расшифровать</button>
+        <button id="clearBtn" class="ghost">Очистить</button>
+      </div>
+    </div>
+  </div>
+
+  <label style="margin-top:12px">Результат (JSON, содержит alg, mode, salt, iv, data)</label>
+  <div class="result" id="result" contenteditable="false" style="min-height:120px"></div>
+
+  <div style="margin-top:10px" class="controls">
+    <button id="copyBtn" class="ghost">Копировать результат</button>
+    <button id="saveBtn" class="ghost">Сохранить в файл</button>
+  </div>
+
+  <p style="margin-top:12px;color:#8fb0c4;font-size:13px">
+    Примечание: формат результата — JSON в Base64 полях. Для файлов скачивается бинарный файл, содержащий тот же JSON как текст.
+  </p>
+</div>
+
+<script>
+/* ---- Утилиты для Base64 <-> Uint8Array ---- */
+const b64ToBuf = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+const bufToB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+/* ---- Crypto helpers ---- */
+const generateRandomBytes = (len) => {
+  const a = new Uint8Array(len);
+  crypto.getRandomValues(a);
+  return a;
+};
+
+async function importRawKeyFromBase64(b64) {
+  try {
+    const raw = b64ToBuf(b64);
+    return await crypto.subtle.importKey('raw', raw, 'AES-GCM', true, ['encrypt','decrypt']);
+  } catch(e) { throw new Error('Не удалось импортировать Base64 ключ: ' + e.message); }
+}
+
+async function deriveKeyFromPassword(password, salt, iterations=150000) {
+  const enc = new TextEncoder();
+  const pwKey = await crypto.subtle.importKey('raw', enc.encode(password), {name:'PBKDF2'}, false, ['deriveKey']);
+  return crypto.subtle.deriveKey({
+    name:'PBKDF2',
+    salt,
+    iterations,
+    hash:'SHA-256'
+  }, pwKey, {name:'AES-GCM', length:256}, true, ['encrypt','decrypt']);
+}
+
+/* ---- Encrypt / Decrypt ----
+Output format JSON:
+{ alg: "AES-GCM", mode: "raw"|"pass", salt: base64 or "", iv: base64, data: base64 }
+*/
+async function encryptArrayBuffer(dataBuf, opts) {
+  // opts: {usePassword:boolean, password:string, keyBase64:string}
+  const iv = generateRandomBytes(12);
+  let key;
+  let saltB64 = '';
+
+  if (opts.usePassword) {
+    const salt = generateRandomBytes(16);
+    saltB64 = bufToB64(salt);
+    key = await deriveKeyFromPassword(opts.password, salt);
+  } else {
+    key = await importRawKeyFromBase64(opts.keyBase64);
+  }
+
+  const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, dataBuf);
+  return JSON.stringify({
+    alg: 'AES-GCM',
+    mode: opts.usePassword ? 'pass' : 'raw',
+    salt: saltB64,
+    iv: bufToB64(iv),
+    data: bufToB64(ct)
+  });
+}
+
+async function decryptJson(jsonStr, opts) {
+  // opts: {usePassword:boolean, password:string, keyBase64:string}
+  let obj;
+  try { obj = JSON.parse(jsonStr); } catch(e) { throw new Error('Неверный JSON'); }
+  if (!obj.data || !obj.iv || !obj.alg) throw new Error('JSON не содержит необходимых полей');
+
+  const iv = b64ToBuf(obj.iv);
+  const ct = b64ToBuf(obj.data);
+  let key;
+  if (obj.mode === 'pass' || opts.usePassword) {
+    const salt = obj.salt ? b64ToBuf(obj.salt) : new Uint8Array(0);
+    key = await deriveKeyFromPassword(opts.password, salt);
+  } else {
+    key = await importRawKeyFromBase64(opts.keyBase64);
+  }
+  const plainBuf = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, ct);
+  return plainBuf; // ArrayBuffer
+}
+
+/* ---- UI wiring ---- */
+const plaintext = document.getElementById('plaintext');
+const keyInput = document.getElementById('keyInput');
+const passInput = document.getElementById('passInput');
+const genKey = document.getElementById('genKey');
+const usePass = document.getElementById('usePass');
+const encryptBtn = document.getElementById('encryptBtn');
+const decryptBtn = document.getElementById('decryptBtn');
+const clearBtn = document.getElementById('clearBtn');
+const resultEl = document.getElementById('result');
+const copyBtn = document.getElementById('copyBtn');
+const saveBtn = document.getElementById('saveBtn');
+const fileInput = document.getElementById('fileInput');
+
+let usingPassword = false;
+
+usePass.addEventListener('click', () => {
+  usingPassword = !usingPassword;
+  usePass.textContent = usingPassword ? 'Используется пароль' : 'Использовать пароль';
+  usePass.classList.toggle('ghost', !usingPassword);
+});
+
+/* Генерация Base64 ключа 32 байта */
+genKey.addEventListener('click', () => {
+  const key = generateRandomBytes(32);
+  keyInput.value = bufToB64(key);
+});
+
+/* Очистить поля */
+clearBtn.addEventListener('click', () => {
+  plaintext.value = '';
+  keyInput.value = '';
+  passInput.value = '';
+  resultEl.textContent = '';
+  fileInput.value = '';
+});
+
+/* Копировать результат */
+copyBtn.addEventListener('click', async () => {
+  const text = resultEl.textContent || '';
+  if (!text) return alert('Нечего копировать');
+  await navigator.clipboard.writeText(text);
+  alert('Скопировано в буфер обмена');
+});
+
+/* Сохранить результат в файл */
+saveBtn.addEventListener('click', () => {
+  const text = resultEl.textContent || '';
+  if (!text) return alert('Нечего сохранять');
+  const blob = new Blob([text], {type:'application/json;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'encrypted.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+/* Шифрование (текст или файл) */
+encryptBtn.addEventListener('click', async () => {
+  try {
+    const opts = {usePassword:usingPassword, password:passInput.value, keyBase64:keyInput.value};
+    if (fileInput.files && fileInput.files[0]) {
+      const f = fileInput.files[0];
+      const ab = await f.arrayBuffer();
+      const json = await encryptArrayBuffer(ab, opts);
+      resultEl.textContent = json;
+      // также предложим скачать зашифрованный файл как binary (.bin) содержащий тот же JSON
+      const blob = new Blob([json], {type:'application/octet-stream'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = f.name + '.enc';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } else {
+      const encoder = new TextEncoder();
+      const arr = encoder.encode(plaintext.value || '');
+      const json = await encryptArrayBuffer(arr.buffer, opts);
+      resultEl.textContent = json;
+    }
+  } catch(e) { alert('Ошибка при шифровании: ' + (e.message||e)); }
+});
+
+/* Расшифровка */
+decryptBtn.addEventListener('click', async () => {
+  try {
+    const jsonText = resultEl.textContent.trim();
+    if (!jsonText) return alert('Вставьте JSON результата в поле "Результат" или загрузите .enc файл в поле файл');
+    const opts = {usePassword:usingPassword, password:passInput.value, keyBase64:keyInput.value};
+
+    const plainBuf = await decryptJson(jsonText, opts);
+
+    // Если исходно был файл — предложим скачать (определить это сложно автоматически). Попробуем показать текст, и также предложим скачать бинар:
+    const decoder = new TextDecoder();
+    try {
+      const text = decoder.decode(plainBuf);
+      // покажем первые 2000 символов в textarea (если это текст)
+      if (text.length > 0 && isMostlyText(text)) {
+        plaintext.value = text;
+        alert('Расшифровка успешна — текст вставлен в поле сообщения.');
+        return;
+      }
+    } catch(e){ /*ignore*/ }
+
+    // иначе — скачиваем бинарный файл
+    const blob = new Blob([plainBuf], {type:'application/octet-stream'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'decrypted.bin';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    alert('Расшифровка успешна — бинарный файл скачан.');
+  } catch(e) { alert('Ошибка при расшифровке: ' + (e.message||e)); }
+});
+
+/* Вспомогательная проверка — в основном ASCII/UTF-8 текст? */
+function isMostlyText(s) {
+  // простая эвристика: процент печатаемых символов
+  const printable = s.split('').filter(ch => (ch.charCodeAt(0) >= 9 && ch.charCodeAt(0) <= 13) || (ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) <= 126)).length;
+  return (printable / Math.max(1, s.length)) > 0.7;
+}
+</script>
+</body>
+</html>
